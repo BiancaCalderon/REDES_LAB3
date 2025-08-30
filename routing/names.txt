@@ -1,8 +1,8 @@
 {
-  "type": "names", 
+  "type": "names",
   "config": {
     "A": "nodeA@server.com",
-    "B": "nodeB@server.com", 
+    "B": "nodeB@server.com",
     "C": "nodeC@server.com",
     "D": "nodeD@server.com"
   }
