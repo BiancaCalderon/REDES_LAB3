@@ -4,6 +4,7 @@ import socket
 import time
 from typing import Dict, List, Set
 from dataclasses import dataclass
+from redis_adapter import RedisAdapter
 import uuid
 
 @dataclass
@@ -50,14 +51,15 @@ class Message:
 class FloodingRouter:
     def __init__(self, node_id: str, port: int):
         self.node_id = node_id
-        self.port = port
-        self.neighbors = {}  # {neighbor_id: (ip, port)} - SOLO vecinos directos
+        self.transport_type = transport
         self.running = False
-        self.socket = None
-        
-        # Para evitar loops infinitos en flooding
-        self.seen_messages: Set[str] = set()  # IDs de mensajes ya procesados
+        self.seen_messages = set()
         self.message_history_limit = 1000
+        
+        if transport == "redis":
+            self.adapter = RedisAdapter(node_id)
+        else:
+            raise ValueError("Solo soportamos Redis en esta fase")
         
     def load_topology(self, topo_file: str):
         """Carga SOLO los vecinos directos desde archivo JSON"""
@@ -79,44 +81,23 @@ class FloodingRouter:
         # Flooding no necesita esto, pero lo mantenemos por compatibilidad
         pass
     
-    def flood_message(self, message: Message, exclude_node: str = None):
-        """
-        Flooding: envía mensaje a TODOS los vecinos excepto exclude_node
-        Esta es la lógica central del algoritmo de flooding
-        """
-        # Verificar TTL
-        if message.ttl <= 0:
-            print(f"[{self.node_id}] TTL agotado para mensaje {message.message_id}")
+    def flood_message(self, message, exclude_node=None):
+        if message["ttl"] <= 0:
+            print(f"[{self.node_id}] TTL agotado")
             return
-            
-        # Si el mensaje es para este nodo
-        if message.to_node == self.node_id:
-            print(f"[{self.node_id}] 🎯 Mensaje recibido de {message.from_node}: {message.payload}")
+
+        if message["to"] == self.node_id:
+            print(f"[{self.node_id}] Mensaje recibido de {message['from']}: {message['payload']}")
             return
-            
-        # Decrementar TTL
-        message.ttl -= 1
-        
-        # FLOODING: Enviar a TODOS los vecinos excepto de donde vino
-        flooded_to = []
-        for neighbor_id, (ip, port) in self.neighbors.items():
-            # No reenviar al nodo que nos envió el mensaje
-            if neighbor_id == exclude_node:
+
+        message["ttl"] -= 1
+
+        for neighbor in self.neighbors:
+            if neighbor == exclude_node:
                 continue
-                
-            try:
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(3.0)
-                    s.connect((ip, port))
-                    s.send(message.to_json().encode())
-                    flooded_to.append(neighbor_id)
-            except Exception as e:
-                print(f"[{self.node_id}] ❌ Error enviando a {neighbor_id}: {e}")
-        
-        if flooded_to:
-            print(f"[{self.node_id}] 📡 Flooding msg {message.message_id} to: {flooded_to} (destino: {message.to_node})")
-        else:
-            print(f"[{self.node_id}] ⚠️  No pude reenviar mensaje {message.message_id} a ningún vecino")
+            self.adapter.send(neighbor, message)
+        print(f"[{self.node_id}] Flood hacia vecinos: {self.neighbors}")
+
     
     def handle_hello(self, message: Message, client_socket):
         """Maneja mensajes hello para descubrimiento de vecinos"""
@@ -253,23 +234,23 @@ class FloodingRouter:
             self.send_hellos()
     
     def start(self):
-        """Inicia el nodo"""
         self.running = True
-        
-        # Iniciar procesos en hilos separados
-        forwarding_thread = threading.Thread(target=self.forwarding_process)
-        routing_thread = threading.Thread(target=self.routing_process)
-        
-        forwarding_thread.daemon = True
-        routing_thread.daemon = True
-        
-        forwarding_thread.start()
-        routing_thread.start()
-        
-        print(f"[{self.node_id}] 🚀 Nodo Flooding iniciado")
-        print(f"[{self.node_id}] 📋 Vecinos: {list(self.neighbors.keys())}")
-        
-        return forwarding_thread, routing_thread
+
+        def on_message(msg):
+            msg_id = msg.get("message_id")
+            if msg_id in self.seen_messages:
+                return
+            self.seen_messages.add(msg_id)
+
+            if msg["type"] == "message":
+                self.flood_message(msg, exclude_node=msg["from"])
+            elif msg["type"] in ["hello", "hello_ack"]:
+                print(f"[{self.node_id}] Mensaje hello: {msg}")
+
+        self.adapter.start(on_message)
+        print(f"[{self.node_id}] Nodo Flooding iniciado con Redis")
+
+
     
     def stop(self):
         """Detiene el nodo"""
@@ -308,52 +289,37 @@ def main():
         return
     
     node_id = sys.argv[1]
-    
-    # Puerto base + offset según el nodo
-    port_map = {"A": 8001, "B": 8002, "C": 8003, "D": 8004}
-    port = port_map.get(node_id, 8000)
-    
-    router = FloodingRouter(node_id, port)
+    router = FloodingRouter(node_id, transport="redis")
     
     try:
-        # Cargar configuración (solo vecinos directos)
-        router.load_topology("topo.txt")
-        router.load_names("names.txt")
-        
-        # Iniciar nodo
         router.start()
-        
-        # Interfaz simple para enviar mensajes
-        print(f"\n[{node_id}] 💬 Comandos:")
-        print("  send <destino> <mensaje>")
-        print("  neighbors")
-        print("  quit")
-        
+        print(f"\n[{node_id}] Comandos:\n  send <dest> <msg>\n  quit")
+
         while True:
-            try:
-                cmd = input(f"{node_id}> ").strip().split()
-                
-                if not cmd:
-                    continue
-                    
-                if cmd[0] == "quit":
-                    break
-                elif cmd[0] == "send" and len(cmd) >= 3:
-                    dest = cmd[1]
-                    msg = " ".join(cmd[2:])
-                    router.send_message(dest, msg)
-                elif cmd[0] == "neighbors":
-                    print(f"Vecinos de {node_id}: {list(router.neighbors.keys())}")
-                else:
-                    print("Comando inválido")
-                    
-            except KeyboardInterrupt:
+            cmd = input(f"{node_id}> ").strip().split()
+            if not cmd:
+                continue
+            if cmd[0] == "quit":
                 break
-                
-    except Exception as e:
-        print(f"Error: {e}")
+            elif cmd[0] == "send" and len(cmd) >= 3:
+                dest = cmd[1]
+                msg = " ".join(cmd[2:])
+                router.adapter.send(dest, {
+                    "proto": "flooding",
+                    "type": "message",
+                    "from": node_id,
+                    "to": dest,
+                    "ttl": 10,
+                    "headers": {},
+                    "payload": msg
+                })
+            else:
+                print("Comando inválido")
+
+    except KeyboardInterrupt:
+        pass
     finally:
-        router.stop()
+        router.adapter.stop()
 
 if __name__ == "__main__":
     main()
