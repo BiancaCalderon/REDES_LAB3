@@ -10,6 +10,9 @@ class FloodingRouterAsync:
 
     async def start(self):
         async def on_message(msg):
+            if not isinstance(msg, dict):
+                print(f"[{self.node_id}] (ignorado) mensaje no-JSON: {msg!r}")
+                return
             mid = msg.get("message_id")
             if mid in self.seen:
                 return

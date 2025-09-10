@@ -59,32 +59,46 @@ class LinkStateRouterAsync:
 
     def _recompute(self):
         g = self._graph()
-        dist = {n: float("inf") for n in g}
-        prev = {n: None for n in g}
+        nodes = set(g.keys())
+        for u in g:
+            nodes.update(g[u].keys())
+        nodes = list(nodes)
+
+        import math, heapq
+        dist = {n: math.inf for n in nodes}
+        prev = {n: None for n in nodes}
+        if self.node_id not in dist:
+            dist[self.node_id] = 0  # por seguridad
+            nodes.append(self.node_id)
         dist[self.node_id] = 0
+
         pq = [(0, self.node_id)]
+        visited = set()
         while pq:
             d, u = heapq.heappop(pq)
+            if u in visited: 
+                continue
+            visited.add(u)
             for v, w in g.get(u, {}).items():
-                nd = d + w
-                if nd < dist.get(v, float("inf")):
+                nd = d + float(w)
+                if nd < dist.get(v, math.inf):
                     dist[v] = nd
                     prev[v] = u
                     heapq.heappush(pq, (nd, v))
 
         self.routing_table = {}
-        for dest in dist:
-            if dest != self.node_id and dist[dest] < float("inf"):
-                path = []
-                cur = dest
-                while cur is not None:
-                    path.append(cur)
-                    cur = prev[cur]
-                path.reverse()
-                if len(path) > 1:
-                    self.routing_table[dest] = (path[1], dist[dest])
+        for dest in nodes:
+            if dest == self.node_id or dist.get(dest, math.inf) == math.inf:
+                continue
+            # reconstruir path
+            path, cur = [], dest
+            while cur is not None:
+                path.append(cur); cur = prev.get(cur)
+            path.reverse()
+            if len(path) > 1:
+                self.routing_table[dest] = (path[1], dist[dest])
         print(f"[{self.node_id}] 🗺️ Tabla rutas: {self.routing_table}")
-
+    
     async def _emit_lsp(self):
         self.lsp_seq += 1
         hdr = {"lsp": {"origin": self.node_id, "seq": self.lsp_seq, "links": self.neighbors, "age": time.time()}}
@@ -109,16 +123,23 @@ class LinkStateRouterAsync:
 
     async def forward_message(self, msg):
         dest = msg["to"]
+        if dest in self.neighbors:
+            msg["ttl"] -= 1
+            if msg["ttl"] <= 0: 
+                return
+            await self.adapter.send(dest, msg)
+            print(f"[{self.node_id}] 📡 (vecino) → {dest}")
+            return
+
         if dest not in self.routing_table:
-            print(f"[{self.node_id}] Sin ruta hacia {dest}")
+            print(f"[{self.node_id}] ⚠️ Sin ruta hacia {dest}")
             return
         next_hop, _ = self.routing_table[dest]
         msg["ttl"] -= 1
-        if msg["ttl"] <= 0:
-            print(f"[{self.node_id}] ⏱TTL agotado para {dest}")
+        if msg["ttl"] <= 0: 
             return
         await self.adapter.send(next_hop, msg)
-        print(f"[{self.node_id}] Reenviado hacia {dest} via {next_hop}")
+        print(f"[{self.node_id}] 📦 {dest} via {next_hop}")
 
     async def send_message(self, dest, payload):
         msg = {
