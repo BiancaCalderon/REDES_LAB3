@@ -1,38 +1,56 @@
-
-import asyncio
-import json
-import redis.asyncio as redis
+import asyncio, json, redis.asyncio as redis
 
 class RedisAdapterAsync:
-    def __init__(self, node_id: str, host="localhost", port=6379, password=None):
-        self.node_id = node_id
-        self.redis = redis.Redis(host=host, port=port, password=password, decode_responses=True)
-        self.pubsub = self.redis.pubsub()
-        self.running = False
+    def __init__(self, channel, host, port, password):
+        self.channel = channel
+        self.r = redis.Redis(host=host, port=port, password=password, decode_responses=False)
+        self._pubsub = None
+        self._task = None
+        self._on_message = None
 
     async def start(self, on_message):
-        # empieza a escuchar mensajes en el canal del nodo
-        self.running = True
-        await self.pubsub.subscribe(self.node_id)
-        asyncio.create_task(self._listen(on_message))
-        print(f"[{self.node_id}] Subscrito en canal remoto")
-
-    async def _listen(self, on_message):
-        while self.running:
-            msg = await self.pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-            if msg:
-                try:
-                    data = json.loads(msg["data"])
-                except:
-                    data = msg["data"]
-                await on_message(data)
-
-    async def send(self, dest: str, message: dict):
-        await self.redis.publish(dest, json.dumps(message))
+        self._on_message = on_message
+        self._pubsub = self.r.pubsub()
+        await self._pubsub.subscribe(self.channel)
+        self._task = asyncio.create_task(self._listen())
+        print(f"[{self.channel}] Subscrito en canal remoto")
 
     async def stop(self):
-        self.running = False
-        await self.pubsub.unsubscribe(self.node_id)
-        await self.pubsub.close()
-        await self.redis.close()
-        print(f"[{self.node_id}] Desconectado")
+        try:
+            if self._pubsub:
+                await self._pubsub.unsubscribe(self.channel)
+                await self._pubsub.close()
+        finally:
+            self._pubsub = None
+        if self._task:
+            self._task.cancel()
+            self._task = None
+        await self.r.close()
+        print(f"[{self.channel}] Desconectado")
+
+    async def send(self, dest_channel: str, message):
+        # se publica en el canal destino
+        if isinstance(message, (dict, list)):
+            payload = json.dumps(message).encode()
+        elif isinstance(message, str):
+            payload = message.encode()
+        else:
+            payload = json.dumps(message).encode()
+        await self.r.publish(dest_channel, payload)
+
+    async def _listen(self):
+        while True:
+            msg = await self._pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
+            if not msg:
+                await asyncio.sleep(0.01)
+                continue
+            data = msg.get("data")
+            if isinstance(data, (bytes, bytearray)):
+                try:
+                    obj = json.loads(data.decode())
+                except Exception:
+                    obj = data.decode(errors="ignore")
+            else:
+                obj = data
+            if self._on_message:
+                await self._on_message(obj)

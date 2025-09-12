@@ -1,9 +1,9 @@
 from config_remote import chanN
 
-# Tu canal (grupo 8, nodo 8)
+
 MY = chanN(8)
 
-# Vecinos **directos** de N8 con pesos (según la topología del profe)
+
 NEIGHBORS = {
     chanN(7): 7,
     chanN(3): 15,
